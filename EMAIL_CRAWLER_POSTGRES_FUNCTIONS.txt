@@ -1,0 +1,296 @@
+#################################
+do_updates
+#################################
+
+CREATE OR REPLACE FUNCTION crawler.do_updates(jdoc jsonb)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+AS $function$
+Declare
+	_job_id uuid;
+	_email_id text;
+	_update_task text;
+
+	_tmp jsonb;
+
+BEGIN
+	_update_task := jdoc#>>'{update_task}';
+	_job_id :=  jdoc#>>'{job_id}';
+
+	if _update_task = 'crawler_exec_status' then
+		update crawler.job_config 
+			set crawler_status = jdoc#>>'{data}',crawler_id = (jdoc#>>'{source_id}')::uuid
+			where job_id = _job_id::uuid;
+		
+	elsif _update_task = 'crawler_exec_status_finally' then
+		update crawler.job_config 
+			set crawler_id = null
+			where job_id = _job_id::uuid;
+		
+	elsif _update_task = 'scraper_exec_status' then
+		update crawler.job_config 
+			set scraper_status = jdoc#>>'{data}',scraper_id = (jdoc#>>'{source_id}')::uuid
+			where job_id = _job_id::uuid;
+		
+	elsif _update_task = 'last_email_index' then
+		update crawler.job_config 
+			set last_email_index  = (jdoc#>>'{data}')::timestamp 
+			where job_id = _job_id;
+		
+	elsif _update_task = 'set_email_summary' then
+		_email_id :=  jdoc#>>'{email_id}';
+		update crawler.processed_emails  
+			set details = jdoc#>'{data}'
+			where email_id = _email_id;
+		
+	elsif _update_task = 'register_new_email' then
+	
+		if (select count(*) from crawler.processed_emails where email_id = jdoc#>>'{data}' and job_id=(jdoc#>>'{job_id}')::uuid)=0 then 
+			insert into crawler.processed_emails(email_id,job_id) values (jdoc#>>'{data}',_job_id::uuid);
+			return jsonb_build_object('email_registered',True);			
+		else
+			return jsonb_build_object('email_registered',False);
+		end if;
+	
+	
+	elsif _update_task = 'update_log' then			
+		insert into crawler.application_logs values (now(),_job_id::uuid,jdoc#>>'{source}',jdoc#>>'{source_id}',jdoc#>>'{log_type}',(jdoc#>>'{log_details}')::jsonb);
+	
+	--elsif _update_task = 'register_new_email' then
+	--	_email_id :=  jdoc#>>'{email_id}';	
+	--	delete from email_crawler.processed_emails where email_id = _email_id;
+	else 
+		return jsonb_build_object('response',jsonb_build_object('status','error','message','Invalid API Call'));
+	end if;
+
+	return jsonb_build_object('response',jsonb_build_object('status','ok'));
+
+END;
+$function$
+;
+
+
+
+#################################
+get_jobs
+#################################
+
+CREATE OR REPLACE FUNCTION crawler.get_jobs(crw_id text)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+AS $function$
+
+
+begin
+	-- Claim jobs
+	update crawler.job_config set crawler_id = crw_id::uuid 
+	WHERE is_active = true 
+	and crawler_id is null 
+	and coalesce(crawler_status,'') <> 'Running' 
+	and schedule ? to_char(NOW(), 'Dy');
+
+	-- Return claimed jobs				
+	RETURN (    
+			SELECT jsonb_agg(t)
+		        FROM (
+		        		--to launch crawlers based on job config
+		                SELECT job_id,crawler_config
+		                FROM crawler.job_config 
+		                WHERE is_active = true
+		                and crawler_id = crw_id::uuid
+		                and schedule ? to_char(NOW(), 'Dy')
+		             ) t
+		       );-- return QUERY        
+END;
+$function$
+;
+
+
+
+#################################
+job_config_history_in
+#################################
+
+
+CREATE OR REPLACE FUNCTION crawler.job_config_history_in()
+ RETURNS trigger
+ LANGUAGE plpgsql
+AS $function$
+   BEGIN
+      INSERT INTO crawler.job_config_history(job_id,job_metadata,crawler_config,scraper_config,last_email_index,
+      											  schedule,is_active,crawler_status,crawler_id ,scraper_status,scraper_id) 
+      VALUES (new.job_id,new.job_metadata,new.crawler_config,new.scraper_config,new.last_email_index,	
+      		new.schedule,new.is_active ,new.crawler_status,new.crawler_id,new.scraper_status,new.scraper_id);
+	 RETURN NEW;
+   END;
+$function$
+;
+
+
+#################################
+job_get_config
+#################################
+
+
+CREATE OR REPLACE FUNCTION crawler.job_get_config(jdoc jsonb)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+AS $function$
+Declare
+	_job_id uuid;
+	_source_id uuid;
+	_source text;
+	_result jsonb;
+	_abc jsonb;
+
+BEGIN
+	
+	
+	if jdoc ?& array['job_id']  then
+		_job_id := (jdoc#>>'{job_id}')::uuid;
+		_source_id := (jdoc#>>'{source_id}')::uuid;
+		_source := (jdoc#>>'{source}')::text;
+		
+		if (select count(*)>0
+			from crawler.job_config
+			where job_id = _job_id			
+			and is_active
+			and crawler_id = _source_id)
+			--and case when crawler_id is not null then false else true end)			
+		then 
+			_result := (select
+							jsonb_build_object(
+								'response',jsonb_build_object(
+									'status','ok'),
+								'job_id', job_id,
+								'last_email_index',last_email_index::text,
+								'crawler_config', crawler_config,
+								'it_contact',job_metadata->>'it_contact',
+								'business_contact', job_metadata->>'bussines_contact'
+							) 
+						from crawler.job_config
+						where job_id = _job_id);
+			
+			--Call set_logs funcion
+			 _abc := (select crawler.set_logs (		  		 
+							jsonb_build_object(
+								'job_id', _job_id,
+								'source_id',_source_id,
+								'source', _source,
+								'log_type','INFO',
+								'log_details',jsonb_build_array(jsonb_build_object('status','ok','msg','config dispatched'))
+							) 
+					));
+					
+		else
+			_result := jsonb_build_object('response',jsonb_build_object('status','error','message','Agent not found or inactive'));
+		end if;	
+	else
+		_result := jsonb_build_object('response',jsonb_build_object('status','error','message','Invalid API Call'));
+	end if;
+	
+	return _result;
+	
+END;
+$function$
+;
+
+
+
+
+#################################
+set_logs
+#################################
+
+
+
+CREATE OR REPLACE FUNCTION crawler.set_logs(jdoc jsonb)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+AS $function$
+Declare
+	_job_id uuid;
+	_source_id uuid;
+	_source_type text;
+	_log_type text;
+	_log_details jsonb;
+
+BEGIN
+	_job_id := (jdoc#>>'{job_id}')::uuid;
+    _source_id := (jdoc#>>'{source_id}')::uuid;
+    _source_type := (jdoc#>>'{source}');
+    _log_type := (jdoc#>>'{log_type}');
+    _log_details := (jdoc#>'{log_details}');
+   
+	insert into crawler.application_logs(job_id,source_id,source,log_type,log_details) 
+		values(_job_id,_source_id,_source_type,_log_type,_log_details);
+
+Return jsonb_build_object('response',jsonb_build_object('status','ok'));
+
+END;
+$function$
+;
+
+
+#################################
+worker_get_config
+#################################
+
+
+
+CREATE OR REPLACE FUNCTION crawler.worker_get_config(jdoc jsonb)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+AS $function$
+Declare
+	_job_id uuid;
+	_email_id text;
+	_result jsonb;
+	_abc jsonb;
+BEGIN
+	
+	
+	if jdoc ?& array['job_id','email_id']  then
+		_job_id := (jdoc#>>'{job_id}')::uuid;
+		_email_id := (jdoc#>>'{email_id}');
+		
+		if (select count(*)>0
+			from crawler.processed_emails
+			where job_id = _job_id
+			and email_id = _email_id
+			) 
+			--and (select 
+				--	case when scraper_id is not null then false else true end
+				--	from email_crawler.job_config where job_id =_job_id) 			 
+		then 
+			_result := (select
+							jsonb_build_object(
+								'response',jsonb_build_object(
+									'status','ok'),
+								--'session_id',(_result#>>'{session_id}')::uuid,
+								--'scraper_id', uuid_generate_v4(),
+								'worker_config',scraper_config,
+								'it_contact',job_metadata->>'created_by',
+								'email_details',(select details from crawler.processed_emails where job_id = _job_id and email_id = _email_id)
+							) 
+						from crawler.job_config
+						where job_id = _job_id);			
+			
+			 					
+		else
+			_result := jsonb_build_object('response',jsonb_build_object('status','error','message','Email not found or agent inactive'));
+		end if;	
+	else
+		_result := jsonb_build_object('response',jsonb_build_object('status','error','message','Invalid API Call'));
+	end if;
+	
+	return _result;
+	
+END;
+$function$
+;
+
+
+
+
+
