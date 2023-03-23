@@ -1,0 +1,8 @@
+extract_msg
+pandas
+pyarrow
+xlrd
+openpyxl==3.1.0
+requests
+pg8000
+numpy
